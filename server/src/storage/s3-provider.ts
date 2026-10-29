@@ -6,7 +6,8 @@ import {
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
 import { putS3Multipart } from "./s3-multipart.js";
-import { Readable } from "node:stream";
+import { withS3FailureDiagnostics } from "./s3-failure.js";
+import { addAbortSignal, Readable } from "node:stream";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { notFound, unprocessable } from "../errors.js";
 
@@ -86,7 +87,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
         await putS3Multipart(client, bucket, key, input);
         return;
       }
-      await client.send(
+      await withS3FailureDiagnostics("put_object", () => client.send(
         new PutObjectCommand({
           Bucket: bucket,
           Key: key,
@@ -94,22 +95,25 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           ContentType: input.contentType,
           ContentLength: input.contentLength,
         }),
-      );
+      ));
     },
 
     async getObject(input): Promise<GetObjectResult> {
       const key = buildKey(prefix, input.objectKey);
       try {
-        const output = await client.send(
+        const output = await withS3FailureDiagnostics("get_object", () => client.send(
           new GetObjectCommand({
             Bucket: bucket,
             Key: key,
             Range: input.range ? `bytes=${input.range.start}-${input.range.end}` : undefined,
           }),
-        );
+          { abortSignal: input.signal },
+        ));
 
+        const stream = await toReadableStream(output.Body);
+        if (input.signal) addAbortSignal(input.signal, stream);
         return {
-          stream: await toReadableStream(output.Body),
+          stream,
           contentType: output.ContentType,
           contentLength: output.ContentLength,
           etag: output.ETag,
@@ -125,12 +129,13 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
     async headObject(input): Promise<HeadObjectResult> {
       const key = buildKey(prefix, input.objectKey);
       try {
-        const output = await client.send(
+        const output = await withS3FailureDiagnostics("head_object", () => client.send(
           new HeadObjectCommand({
             Bucket: bucket,
             Key: key,
           }),
-        );
+          { abortSignal: input.signal },
+        ));
 
         return {
           exists: true,
@@ -148,12 +153,12 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
 
     async deleteObject(input): Promise<void> {
       const key = buildKey(prefix, input.objectKey);
-      await client.send(
+      await withS3FailureDiagnostics("delete_object", () => client.send(
         new DeleteObjectCommand({
           Bucket: bucket,
           Key: key,
         }),
-      );
+      ));
     },
   };
 }

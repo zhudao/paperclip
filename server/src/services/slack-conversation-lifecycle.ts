@@ -1,10 +1,11 @@
+import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
 /** Both run finalization and provider publication can arrive first. Re-read
  * durable evidence under the task lock; never infer completion from prose. */
-export async function settleSlackConversation(db: Db, companyId: string, issueId: string): Promise<boolean> {
+export async function settleExternalConversation(db: Db, companyId: string, issueId: string): Promise<boolean> {
   let activity: ActivityPublication | null = null;
   const settled = await db.transaction(async (tx) => {
     // Match chat admission's endpoint -> task lock order. A closed/revoked
@@ -13,7 +14,9 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
       .from(chatConversations)
       .innerJoin(chatEndpoints, and(eq(chatEndpoints.id, chatConversations.endpointId), eq(chatEndpoints.companyId, chatConversations.companyId)))
       .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId),
-        eq(chatEndpoints.provider, "slack"), inArray(chatConversations.state, ["active", "waiting"]),
+        sql`(${chatEndpoints.provider} = 'slack' or (${chatEndpoints.provider} = 'speko' and exists
+          (select 1 from issues owned where owned.id = ${chatConversations.issueId} and owned.company_id = ${chatConversations.companyId}
+            and owned.origin_id = ${chatEndpoints.id}::text)))`, inArray(chatConversations.state, ["active", "waiting"]),
         inArray(chatEndpoints.status, ["active", "verifying"])))
       .orderBy(desc(chatConversations.createdAt)).limit(1)
       .for("update", { of: chatEndpoints });
@@ -88,10 +91,11 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
       .where(and(eq(chatConversations.id, binding.conversation.id), eq(chatConversations.companyId, companyId), eq(chatConversations.state, "active")))
       .returning({ id: chatConversations.id });
     if (!changed.length) return false;
+    await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
     await tx.update(issues).set({ status: "in_review", updatedAt: new Date() })
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
     activity = (await persistActivity(tx as unknown as Db, {
-      companyId, actorType: "system", actorId: "slack-conversation", action: "issue.updated",
+      companyId, actorType: "system", actorId: `${binding.endpoint.provider}-conversation`, action: "issue.updated",
       entityType: "issue", entityId: issueId, runId: run.id,
       details: { status: "in_review", externalConversationState: "waiting", conversationId: binding.conversation.id,
         issueTitle: issue.title, issueIdentifier: issue.identifier },
@@ -101,3 +105,6 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
   if (activity) publishActivity(activity);
   return settled;
 }
+
+/** Compatibility name for existing Slack callers. */
+export const settleSlackConversation = settleExternalConversation;
