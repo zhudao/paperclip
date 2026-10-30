@@ -1,3 +1,5 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { notifyChatCompanyAuthorityChange } from "./chat-run-milestone-notifications.js";
 import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
@@ -740,6 +742,9 @@ export function accessService(db: Db) {
         eq(issues.assigneeUserId, existing.principalId),
         sql`${issues.status} not in ('done', 'cancelled')`,
       );
+      await notifyNativeStatusReassessment(tx, { companyId });
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
       const resetInProgress = await tx
         .update(issues)
         .set({
