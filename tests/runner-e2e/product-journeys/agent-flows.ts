@@ -18,7 +18,7 @@ import { agentJourneyRuns } from "./catalog.js";
 import { JourneyError, type JourneyContext, type JourneyEvidence, type TargetSession } from "./types.js";
 
 type Row = Record<string, any>;
-type AgentJourney = Exclude<keyof typeof agentJourneyRuns, "ask-question">;
+type AgentJourney = Exclude<keyof typeof agentJourneyRuns, "ask-question" | "question-answer-resume" | "followup-while-running">;
 interface TaskState { currentIssue: Row & { id: string; status: string }; taskRuns: Array<Row & { status: string }>; comments: Row[]; interactions: Array<Row & { id: string; status: string }>; attachments: StoryDelivery[] }
 interface Options { deadlineAt: number; directory: string; capture(id: string, label: string, file: string): Promise<void> }
 const active = (run: Row) => ["queued", "running"].includes(run.status);
@@ -46,7 +46,7 @@ export function validateAgentTaskState(context: JourneyContext, issueId: string,
   }
 }
 
-async function waitFor<T>(deadlineAt: number, load: () => Promise<T>, accept: (value: T) => boolean, code: string): Promise<T> {
+export async function waitFor<T>(deadlineAt: number, load: () => Promise<T>, accept: (value: T) => boolean, code: string): Promise<T> {
   while (Date.now() < deadlineAt) {
     const value = await load();
     if (accept(value)) return value;
@@ -97,6 +97,9 @@ export async function runAgentJourney(id: AgentJourney, context: JourneyContext,
     const runs = state.taskRuns.filter(run => run.status === "succeeded");
     if (!runs.length || runs.some(run => !Number.isFinite(Date.parse(run.finishedAt)))) throw new JourneyError("failed", "final_run_time_missing");
     const run = [...runs].sort((a, b) => Date.parse(a.finishedAt) - Date.parse(b.finishedAt)).at(-1)!;
+    const companies = await context.api.get<Row[]>("/api/companies?scope=accessible");
+    if (!Array.isArray(companies) || !companies.some(row => row.id === context.company.id)
+      || companies.some(row => typeof row.issuePrefix !== "string" || !row.issuePrefix)) throw new JourneyError("failed", "reply_company_context_missing");
     await open(issue);
     const receipt = await readBoundTaskFinalReply({ page: context.page, runId: run.id, agentId: agent.id,
       load: async () => {
@@ -104,7 +107,7 @@ export async function runAgentJourney(id: AgentJourney, context: JourneyContext,
           context.api.get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${afterSeq}&limit=${limit}`))]);
         return { run: latest.taskRuns.find(row => row.id === run.id)!, comments: latest.comments, events };
       },
-      expectedText: marker, deadlineAt: options.deadlineAt });
+      expectedText: marker, deadlineAt: options.deadlineAt, knownCompanyPrefixes: companies.map(row => row.issuePrefix) });
     await retain(`${issue.id}-final-reply.json`, receipt);
     return receipt;
   };
