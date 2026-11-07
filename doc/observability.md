@@ -359,7 +359,7 @@ attempt or owning phase:
 | `authorization.base`, `.responsible_user`, `.authorizing_user`, `.task_privacy`, `.project_privacy` | The existing base decision, responsible/authorizing-user intersections, and applicable app-record privacy decisions beneath `workspace.access.task_authorization` or `workspace.access.authorization`. These details are scoped to workspace authorization. |
 | `workspace.notification`, `workspace.write` | Notification statements and record writes. |
 | `workspace.materialize.*`, `workspace.checkout.*` | Private source-directory setup and identity verification, existing checkout lookup, Git credential resolution, clone, optional pristine-object cache lookup/publication (`cache_lookup`, `cache_publish`), requested-ref checkout, and atomic publication. The enclosing `heartbeat.prepare.workspace_source_materialize` includes the complete source-materialization path. |
-| `runtime_selection.*` | Completion contracts, session/recovery reads, profiles, interaction materialization, backend discovery, bootstrap, run/coordinator writes, transaction entry/settlement, and workspace synchronization. |
+| `runtime_selection.*` | Completion contracts, session/recovery reads, profiles, interaction materialization, backend discovery, dynamic skill package staging (`skill_assets`), bootstrap, run/coordinator writes, transaction entry/settlement, and workspace synchronization. |
 | `runtime_context.instructions`, `.skills`, `.mcp` | The three concurrent runtime-context branches. Their durations overlap. |
 | `runtime_context.asset_*` | Source reads, manifest hashing, cache lookup, cold materialization, and exact file verification on cold and warm paths. |
 | `skills.inventory`, `.wait`, `.bundled`, `.releases`, `.folders`, `.local_sources` | Company skill reconciliation, waiting for an existing company refresh, and its bundled imports, release verification, folder, and local-source work beneath runtime skill preparation. Inventory children overlap their parent. |
@@ -1548,9 +1548,14 @@ without one, the report has no synthetic reporting stack.
 
 Credential patterns, the current user's home path, registered run-secret values,
 and known host/runtime environment credentials are removed before truncation.
-Declared environment secret bindings are included even when their key has no
-credential-like name. Runtime values are used only for redaction and are never
-copied into an event. Stack fields are limited to 8,192 characters,
+Environment values stay private unless their names and values identify an ordinary
+process setting. Flags and counts require both a setting-name match and a boolean
+or numeric value. Mode labels use a closed value list. Paths, regions, and key
+selectors such as `SORT_KEY` use explicit ordinary-setting names. Unknown opaque
+values remain private, including credentials under arbitrary names. Declared
+secret bindings and recognizable credential contents override ordinary-setting
+exemptions, including short values. Runtime values are used only for redaction
+and are never copied into an event. Stack fields are limited to 8,192 characters,
 exception messages to 2,048, provider titles to 4,096, and provider details to
 12,288. Other diagnostic strings are limited to 200 characters (adapter cause
 messages: 2,048). Truncation is marked in the text and in
