@@ -1,3 +1,4 @@
+import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
@@ -269,6 +270,7 @@ function resolveRuntimeLifecyclePolicy(input: HeartbeatRuntimeSelectionInput): N
     persistedPolicy: input.session.persistedNativeExecutionInput?.session.lifecyclePolicy,
     managedAiSelected: Boolean(input.config.managedAiRuntime), managedAiAttribution: input.config.managedAiRuntime?.attribution,
     taskOwned: Boolean(input.workspace.executionTarget?.kind === "remote" && input.workspace.executionTarget.transport === "sandbox" && input.workspace.executionTarget.runnerTask),
+    localTarget: input.workspace.executionTarget?.kind !== "remote",
   });
 }
 
@@ -308,6 +310,13 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   if (nativeRuntimeResolution.kind === "native") {
     if (!issueRef) {
       throw new Error("native_runtime_ineligible: issue is required");
+    }
+    if (run.runtimeMode !== "native" && agent.adapterType === "paperclip_runner"
+      && executionTarget?.kind !== "remote"
+      && nativeRuntimeResolution.profile.backend !== "cursor_cloud_api"
+      && nativeRuntimeResolution.profile.backend !== "claude_managed_agents_api"
+      && nativeRuntimeResolution.profile.backend !== "aws_agentcore_harness_api") {
+      assertPaperclipRunnerBinaryConfiguration();
     }
     const nativeExecutionWorkspaceId =
       persistedNativeExecutionInput?.provider.kind === "cursor_cloud"
@@ -977,6 +986,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         .update(heartbeatRuns)
         .set({
           runtimeMode: "native",
+          legacyProcessSettlement: null,
           controllerBootId: null,
           controllerLeaseExpiresAt: null,
           executionStage: null,
