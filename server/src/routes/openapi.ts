@@ -261,6 +261,7 @@ import {
   reconstructWorkspaceSchema,
   resumeWorkspaceFinalizationSchema,
   confirmNativeControllerStoppedSchema,
+  confirmOwnerGoneSchema,
   cancelIssueThreadInteractionSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
@@ -4283,7 +4284,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List issues in a company",
   description:
-    "Use view=index for collection membership/order without task bodies or diagnostic enrichment; view=rows enriches visible rows without task bodies. These responses include listProjection and cannot stand in for a full issue. view=compact retains the board row compatibility contract. The default response remains the broad compatibility contract. All projections enforce company and task access.",
+    "Use view=index for collection membership/order without task bodies or diagnostic enrichment; view=rows enriches visible rows without task bodies. These responses include listProjection and cannot stand in for a full issue. view=compact retains the board row compatibility contract. The default response remains the broad compatibility contract. All projections enforce company and task access. Results are paged: limit defaults to 500 (maximum 1000) and offset to 0. For actors who can read the whole company's task list, every page sets X-Paperclip-Has-More (true when more results exist) and X-Paperclip-Limit; a capped page also sets X-Paperclip-Next-Offset, or X-Paperclip-Next-After-Id for sortField=id&sortDir=asc cursor paging (not with oneChildPerParent). Actors whose rows are filtered by task access, such as low-trust agents, get no pagination headers. Agent call_api results carry these as pagination.hasMore/nextOffset/nextAfterId. A page whose hasMore is true is not the complete list: repeat the request with the same filters and the next offset or afterId until hasMore is false.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({
@@ -4291,6 +4292,11 @@ registry.registerPath({
       ids: z.string().optional().describe("One to 100 comma-separated task UUIDs; requires index or rows without attention."),
       parentIds: z.string().optional().describe("One to 100 comma-separated parent UUIDs; requires index or rows without attention."),
       oneChildPerParent: z.boolean().optional().describe("Return at most one readable child per parent; requires view=index and parentIds."),
+      limit: z.number().int().min(1).max(1000).optional().describe("Page size; defaults to 500, at most 1000. Check X-Paperclip-Has-More (call_api: pagination.hasMore) for more results."),
+      offset: z.number().int().min(0).optional().describe("Rows to skip; use X-Paperclip-Next-Offset (call_api: pagination.nextOffset) from the previous page."),
+      sortField: z.enum(["updated", "created", "id"]).optional(),
+      sortDir: z.enum(["asc", "desc"]).optional(),
+      afterId: z.string().uuid().optional().describe("Cursor paging: return rows after this task UUID; requires sortField=id, sortDir=asc and no offset. Use X-Paperclip-Next-After-Id (call_api: pagination.nextAfterId)."),
     }).passthrough(),
   },
   responses: {
@@ -7386,6 +7392,7 @@ registry.registerPath({
   path: "/api/cli-auth/me",
   tags: ["access"],
   summary: "Get current CLI auth session",
+  description: "Board-credential read used by `npx paperclipai auth whoami` in the person's own terminal. Agent API keys receive 401: an agent cannot sign a terminal in as a person. To connect someone's terminal, see POST /api/cli-auth/challenges.",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -7405,7 +7412,8 @@ registry.registerPath({
   method: "post",
   path: "/api/cli-auth/challenges",
   tags: ["access"],
-  summary: "Create a CLI auth challenge",
+  summary: "Connect a person's terminal to Paperclip: create a CLI auth challenge for terminal login",
+  description: "Called by the Paperclip CLI in a person's own terminal, never by an agent on their behalf. To connect someone's terminal to Paperclip as themselves, tell them to run `npx paperclipai auth login --api-base <this Paperclip URL>` in that terminal (add `--company-id <companyId>` to name the company). The URL is the address the person already opens Paperclip at in their browser; leave it as that placeholder instead of looking it up, because addresses an agent can see (such as a runner-local API URL) may not be reachable from the person's machine. The CLI prints an approval link; they open it in a browser where they are signed in, review the requesting command, company and Board access, and approve. Only that CLI receives the resulting Board credential. `npx paperclipai auth whoami` confirms who it is signed in as and `npx paperclipai auth logout` revokes it. Agent API keys are a separate identity: never hand out an agent key, create or approve a challenge yourself, or ask for the person's password in chat.",
   request: { body: jsonBody(createCliAuthChallengeSchema) },
   responses: { 200: r.ok(), 400: r.badRequest },
 });
@@ -7415,6 +7423,7 @@ registry.registerPath({
   path: "/api/cli-auth/challenges/{id}/approve",
   tags: ["access"],
   summary: "Approve a CLI auth challenge",
+  description: "Only the signed-in person approves, from the approval page their own CLI printed; agent API keys receive 401. To connect someone's terminal, give them the `npx paperclipai auth login` command (see POST /api/cli-auth/challenges).",
   request: {
     params: z.object({ id: cliAuthChallengeIdParamSchema }),
     body: jsonBody(resolveCliAuthChallengeSchema),
@@ -7444,6 +7453,7 @@ registry.registerPath({
   path: "/api/cli-auth/revoke-current",
   tags: ["access"],
   summary: "Revoke current CLI auth session",
+  description: "Used by `npx paperclipai auth logout` with the CLI's own Board credential; it revokes only that credential and leaves agent API keys untouched.",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -7550,6 +7560,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/managed-agent-profiles",
   tags: ["agents"],
   summary: "Create or operator-attest a Claude Managed Agent profile",
+  description: "Board only: agent credentials get 403. A Claude Managed Agent runs on Anthropic's managed-agents beta. A board operator creates the company profile with an Anthropic API-key secret and a limited environment (no hosts, no packages), attests its qualification and explicitly acknowledges stateful retention before it can be enabled.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(
@@ -8624,6 +8635,16 @@ registry.registerPath({
   summary: "Get skill update status",
   request: { params: z.object({ companyId: z.string(), skillId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/skills/{skillId}/update-diff",
+  tags: ["skills"],
+  summary: "Show what a pending skill source update changes (diff installed vs latest revision)",
+  description: "For a skill installed from a tracked GitHub source, compares the installed source revision (currentRef) with the latest tracked revision (latestRef) and returns each changed package file with a unified line diff: lines starting with \"-\" exist only in the installed revision and lines starting with \"+\" only in the latest one. hasUpdate is false and files is empty when the installed revision is already the latest. A file with change \"not_compared\" was left out of a revision's scan, and diffUnavailable says why a file has no diff. truncated is true when the response reached its size budget. Read-only; it does not apply the update. Use this to review an update before installing it.",
+  request: { params: z.object({ companyId: z.string(), skillId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -9865,7 +9886,8 @@ registry.registerPath({
   path: "/api/instance/database-backups",
   tags: ["instance"],
   summary: "Trigger a database backup",
-  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+  description: "Instance admins only: agent credentials receive 403, and cloud-managed instances run backups for you. Automatic gzip-compressed backups run about hourly by default; instance admins set how long they are kept in the Backup retention section of the company-prefixed /company/settings page. The web UI has no control that creates or restores a backup. For a backup now, an instance admin calls this endpoint, or an operator with shell access to the server runs `paperclipai db:backup` (add --json for metadata). The result names a gzip-compressed SQL file (backupFile) on the server host and its size. Paperclip has no restore endpoint or command: to check a backup, an operator restores the file with psql into a separate, empty PostgreSQL database, never over the live one, and then checks the restored data.",
+  responses: { 201: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 // ─── LLM text endpoints ───────────────────────────────────────────────────────
@@ -11057,6 +11079,15 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/issues/{id}/recovery-actions/confirm-owner-gone",
+  tags: ["issues"],
+  summary: "Confirm that the unrecorded server holding a stuck recovery record stopped, so recovery can release it",
+  body: confirmOwnerGoneSchema,
+  responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/issues/{id}/recovery-actions/retry-workspace-export",
   tags: ["issues"],
   summary: "Retry only workspace export for a repaired accepted native result",
@@ -11486,6 +11517,11 @@ registerCurrentRoute({
 
 // --- Tool access -------------------------------------------------------------
 
+/** Where a person manages a company model service; agents relay this page instead of guessing a settings route. */
+function companyModelServiceSettingsPage(section: string, condition = "") {
+  return `People who manage connections configure, enable and test this in the ${section} section of the company-prefixed /company/settings/connections page; link it as a Markdown link to /<prefix>/company/settings/connections, not the general /company/settings page.${condition} Agent credentials cannot change or test it.`;
+}
+
 for (const [method, suffix, summary] of [
   ["get", "", "Get prompt injection settings and eligible shared OpenRouter connections; non-managers receive no settings or choices"],
   ["put", "", "Configure opt-in prompt injection model checks as a board connection manager"],
@@ -11493,7 +11529,7 @@ for (const [method, suffix, summary] of [
   ["post", "/test", "Classify two fixed billed samples using saved settings as a board connection manager; fallback is not a passing model test"],
 ] as const) registerCurrentRoute({
   method, path: `/api/companies/{companyId}/prompt-injection-prevention${suffix}`,
-  tags: ["prompt-injection-prevention"], summary,
+  tags: ["prompt-injection-prevention"], summary, description: companyModelServiceSettingsPage("Prompt Injection Prevention"),
   ...(method === "put" ? { body: updatePromptInjectionPreventionSchema } : {}),
   ...(method === "post" ? { body: z.object({}).strict() } : {}),
   ...(suffix === "/models" ? { query: z.object({ connectionId: z.string().uuid() }) } : {}),
@@ -11508,6 +11544,7 @@ for (const [method, suffix, summary] of [
   ["post", "/test", "Generate a fixed billed fast response sample"],
   ["get", "/history", "List fast response accounting and publication outcomes"],
 ] as const) registerCurrentRoute({ method, path: `/api/companies/{companyId}/fast-response${suffix}`, tags: ["fast-responses"], summary,
+  description: companyModelServiceSettingsPage("Fast response", " The section is shown only while an instance admin has fast responses turned on in /<prefix>/company/settings/instance/experimental."),
   ...(method === "put" ? { body: updateFastResponseSchema } : {}), responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable } });
 
 const observabilitySignalReceiptSchema = z.object({
@@ -11547,26 +11584,31 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/decision-model", tags: ["decision-models"],
+  description: companyModelServiceSettingsPage("Decision model"),
   summary: "Get decision settings, compatible connections, and manager capability",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 registerCurrentRoute({
   method: "put", path: "/api/companies/{companyId}/decision-model", tags: ["decision-models"],
+  description: companyModelServiceSettingsPage("Decision model"),
   summary: "Configure the company decision model as a connection manager", body: updateDecisionModelSchema,
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
 });
 registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/decision-model/availability", tags: ["decision-models"],
+  description: companyModelServiceSettingsPage("Decision model"),
   summary: "Check local decision configuration and caller authorization without contacting a provider",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 registerCurrentRoute({
   method: "post", path: "/api/companies/{companyId}/decision-model/test", tags: ["decision-models"],
+  description: companyModelServiceSettingsPage("Decision model"),
   summary: "Run the fixed billed three-question setup test as a connection manager",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/decision-model/history", tags: ["decision-models"],
+  description: companyModelServiceSettingsPage("Decision model"),
   summary: "List decision metadata and charges with authorized task links",
   query: costReportQuerySchema.extend({ limit: z.coerce.number().int().min(1).max(500).optional() }),
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },

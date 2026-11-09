@@ -193,6 +193,7 @@ export const NativeProviderStateIncompatibleError = runner.NativeProviderStateIn
 export const NativeProviderSideEffectPendingError = runner.NativeProviderSideEffectPendingError;
 export const NativeRunnerSourceReconciliationRequiredError = runner.NativeRunnerSourceReconciliationRequiredError;
 export const nativeRestartInterruptedTurnId = runner.nativeRestartInterruptedTurnId;
+export const nativeRestartContinuationInFlight = runner.nativeRestartContinuationInFlight;
 
 export const completeTerminatedRemoteNativeSessionCleanup = runner.completeTerminatedRemoteNativeSessionCleanup;
 export const completeTerminatedLocalNativeSessionCleanup = runner.completeTerminatedLocalNativeSessionCleanup;
@@ -218,6 +219,7 @@ export const CONFIGURED_ENVIRONMENT_KEYS = runner.CONFIGURED_ENVIRONMENT_KEYS;
 export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = runner.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
 export const configuredEnvironmentProjection = runner.configuredEnvironmentProjection;
 export const configuredEnvironment = runner.configuredEnvironment;
+export const PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS = runner.PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS;
 
 export const probeNativeRunnerEnvironment = runner.probeNativeRunnerEnvironment;
 

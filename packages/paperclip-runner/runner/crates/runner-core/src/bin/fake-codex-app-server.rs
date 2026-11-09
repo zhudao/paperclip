@@ -1809,6 +1809,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 20}, "last": {"inputTokens": 50, "outputTokens": 10}}
                     }}))?;
                 }
+                // A resumed Codex thread can also report items and the
+                // terminal of the turn lost to a restart after it accepts the
+                // next turn. They are history of an earlier generation.
+                if durable_turn_ids
+                    && state.next_turn > 1
+                    && args
+                        .iter()
+                        .any(|value| value == "--stale-items-after-turn-start")
+                {
+                    let lost_turn_id = format!("provider-turn-{}", state.next_turn - 1);
+                    for (method, params) in [
+                        (
+                            "item/started",
+                            json!({"item": {"id": "lost-item", "type": "agentMessage", "text": ""}}),
+                        ),
+                        (
+                            "item/agentMessage/delta",
+                            json!({"itemId": "lost-item", "delta": "late"}),
+                        ),
+                        (
+                            "item/completed",
+                            json!({"item": {"id": "lost-item", "type": "agentMessage", "text": "late"}}),
+                        ),
+                        (
+                            "turn/completed",
+                            json!({"turn": {"id": lost_turn_id, "status": "failed", "items": [],
+                            "error": {"message": "lost", "codexErrorInfo": "other"}}}),
+                        ),
+                    ] {
+                        let mut params = params;
+                        params["threadId"] = json!(state.thread_id);
+                        if method != "turn/completed" {
+                            params["turnId"] = json!(lost_turn_id);
+                        }
+                        send(json!({"method": method, "params": params}))?;
+                    }
+                }
                 // A notification for a turn the runner never owned fails the
                 // accepted turn before it starts.
                 if args
@@ -1824,6 +1861,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // A loaded host can accept a turn long before it starts it.
                 if let Some(delay) = argument(&args, "--turn-started-delay-ms") {
                     thread::sleep(Duration::from_millis(delay.parse()?));
+                }
+                // A test can hold the start until it has detached the controller.
+                if let Some(gate) = argument(&args, "--turn-started-gate").map(PathBuf::from) {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !gate.is_file() && std::time::Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(10));
+                    }
                 }
                 // An accepted turn can be lost before it starts.
                 if args
