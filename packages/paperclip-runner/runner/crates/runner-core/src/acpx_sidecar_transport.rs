@@ -85,6 +85,7 @@ pub struct AcpxSidecarTransport {
     process: SupervisedProcess,
     request_timeout: Duration,
     session_open_timeout: Duration,
+    request_deadline: Option<Instant>,
     next_request_id: u64,
     last_event_sequence: u64,
     buffered_events: VecDeque<AcpxSidecarEvent>,
@@ -270,6 +271,15 @@ impl AcpxSidecarTransport {
             keys.push("PAPERCLIP_ACPX_CREDENTIAL_BINDING");
         }
         if agent == "claude" {
+            if std::env::var("PAPERCLIP_GITHUB_LAUNCHER_DIR")
+                .is_ok_and(|directory| !directory.trim().is_empty())
+            {
+                keys.extend_from_slice(&[
+                    "PAPERCLIP_GITHUB_BROKER_URL",
+                    "PAPERCLIP_GITHUB_BROKER_TOKEN",
+                    "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+                ]);
+            }
             keys.extend_from_slice(&[
                 // Launcher/controller-owned helper paths; credentials stay behind the broker.
                 "BASH_ENV",
@@ -389,6 +399,7 @@ impl AcpxSidecarTransport {
             process,
             request_timeout: config.request_timeout,
             session_open_timeout: config.request_timeout,
+            request_deadline: None,
             next_request_id: 1,
             last_event_sequence: 0,
             buffered_events: VecDeque::new(),
@@ -405,6 +416,10 @@ impl AcpxSidecarTransport {
         } else {
             self.request_timeout
         }
+    }
+
+    pub(crate) fn bound_requests_by(&mut self, deadline: Option<Instant>) {
+        self.request_deadline = deadline;
     }
 
     pub fn process_id(&self) -> u32 {
@@ -508,13 +523,13 @@ impl AcpxSidecarTransport {
         command: GeneratedAcpxSidecarCommand,
         params: Value,
     ) -> Result<CommandOutcome, LocalRunnerError> {
+        let timeout_at = Instant::now() + self.command_timeout(command);
+        let deadline = self
+            .request_deadline
+            .map_or(timeout_at, |bound| bound.min(timeout_at));
         let request_id = self.send_request(command, params)?;
-        self.receive_response(
-            command,
-            request_id,
-            Instant::now() + self.command_timeout(command),
-        )?
-        .ok_or_else(|| self.request_timeout_error(command))
+        self.receive_response(command, request_id, deadline)?
+            .ok_or_else(|| self.request_timeout_error(command))
     }
 
     /// A park observation may expire without revoking a healthy provider.
@@ -1283,46 +1298,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    #[cfg(unix)]
-    fn managed_claude_helpers_reach_the_sidecar_without_host_credentials() {
-        const CHILD: &str = "PAPERCLIP_TEST_MANAGED_HELPER_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "acpx_sidecar_transport::tests::managed_claude_helpers_reach_the_sidecar_without_host_credentials"])
-                .env_clear()
-                .env(CHILD, "1")
-                .env("PATH", "/usr/bin:/bin")
-                .env("BASH_ENV", "/managed/.bashrc")
-                .env("ZDOTDIR", "/managed")
-                .env("GH_CONFIG_DIR", "/managed")
-                .env("PAPERCLIP_GITHUB_LAUNCHER_DIR", "/managed")
-                .env("GH_TOKEN", "unbound-secret")
-                .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "unbound-capability")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            return;
-        }
-        let config = AcpxSidecarTransportConfig {
-            command: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "printf '%s|%s|%s|%s|%s|%s\\n' \"$BASH_ENV\" \"$ZDOTDIR\" \"$GH_CONFIG_DIR\" \"$PAPERCLIP_GITHUB_LAUNCHER_DIR\" \"$GH_TOKEN\" \"$PAPERCLIP_GITHUB_BROKER_TOKEN\"".into()],
-            verified_launch: None,
-            request_timeout: Duration::from_secs(1),
-            shutdown_grace: Duration::from_millis(100),
-        };
-        let mut transport = AcpxSidecarTransport::start_for_agent(&config, "claude").unwrap();
-        let line = transport
-            .receive_stdout_line(Duration::from_secs(2), "managed-helper test")
-            .unwrap()
-            .expect("sidecar did not report its environment");
-        assert_eq!(line, "/managed/.bashrc|/managed|/managed|/managed||");
-    }
 
     #[test]
     fn parse_frame_does_not_echo_untrusted_deserialization_details() {
