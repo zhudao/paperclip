@@ -1,3 +1,4 @@
+import { safeErrorCauseCode } from "./safe-error-cause.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { spawn } from "node:child_process";
@@ -81,6 +82,15 @@ const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
 export function isRunnerRecoveryMaintenanceCommand(type: string): boolean {
   return ["session.snapshot", "session.goal.get", "runner.drain", "runner.suspend", "runner.shutdown", "turn.stop"].includes(type);
+}
+
+/** The Runner journaled this command before its effect, then died. It sends
+ * that `indeterminate` entry as `failed` with `execution_indeterminate`, never
+ * executes it again, and still treats a lifecycle command as terminal. */
+function isIndeterminateCommandResult(command: DurableRecoveryCoreCommand): boolean {
+  if (command.status === "indeterminate") return true;
+  const detail = command.result?.result;
+  return command.status === "failed" && isRecord(detail) && detail.code === "execution_indeterminate";
 }
 
 const commandTypes = new Set([
@@ -301,8 +311,15 @@ export interface DurablePrpControlPlaneOptions {
   }) => Promise<{ readonly result: unknown; readonly isError?: boolean }>;
   /** Persist the canonical event before the runner receives its cumulative ACK. */
   onCommittedEvent?: (event: PrpEvent) => Promise<void>;
+  /**
+   * Resolve a saved input that has no durable result. Return null to keep it
+   * pending. `admission` says whether this controller instance dispatched the
+   * callback itself, or restored it from a journal that an earlier controller
+   * wrote (for example one that a server restart replaced).
+   */
   recoverSemanticToolInput?: (
-    input: Parameters<NonNullable<DurablePrpControlPlaneOptions["onSemanticToolInput"]>>[0],
+    input: Parameters<NonNullable<DurablePrpControlPlaneOptions["onSemanticToolInput"]>>[0]
+      & { readonly admission: SemanticInputAdmission },
   ) => Promise<{ readonly result: unknown; readonly isError?: boolean } | null>;
   /** Stop this exact owner after a proven, authenticated permanent integrity fault. */
   onProtocolIntegrityError?: (
@@ -312,6 +329,14 @@ export interface DurablePrpControlPlaneOptions {
   onAuthenticatedConnection?: () => void;
   connectionLeaseTtlMs?: number;
 }
+
+/**
+ * Who dispatched a saved semantic input: this controller instance, or an
+ * earlier one whose journal this controller restored. This controller now
+ * owns the journal, so an earlier controller can never record a result for
+ * its callback. The caller decides whether that callback's owner is gone.
+ */
+export type SemanticInputAdmission = "this_controller" | "earlier_controller";
 
 export interface DurablePrpCheckpoint {
   /** Read-only protocol evidence. Does not grant attachment or execution authority. */
@@ -876,19 +901,6 @@ function eventSchemaIssuePaths(issues: readonly { path?: unknown }[] | undefined
   const paths = [...new Set((issues ?? []).map(issue => typeof issue.path === "string" ? issue.path : "")
     .map(path => path.replace(/[^A-Za-z0-9_./-]/g, "_").slice(0, 80)).filter(Boolean))];
   return paths.length ? paths.slice(0, 3).join(",") : "unknown";
-}
-
-function eventCommitFailureCause(error: unknown): string {
-  // Database and transport adapters wrap their coded failure in Error.cause.
-  // Read only bounded codes: messages can contain SQL, arguments or secrets.
-  let current = error;
-  for (let depth = 0; depth < 4 && isRecord(current); depth++) {
-    const code = current.code;
-    if (typeof code === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(code)) return code;
-    current = current.cause;
-  }
-  const name = error instanceof Error ? error.name : typeof error;
-  return /^[A-Za-z0-9_.:-]{1,80}$/.test(name) ? name : "unknown_error";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2042,6 +2054,10 @@ export class DurablePrpControlPlane {
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #connectionLeaseFailure: DurablePrpConnectionLeaseFailure | null = null;
   #pendingSemanticCalls = new Set<string>();
+  /** Result command ids whose callback this instance dispatched live and has
+   * not journaled a result for. A queued result removes its id, so only
+   * in-flight and failed dispatches remain. */
+  #liveDispatchedSemanticCalls = new Set<string>();
   #semanticCallbacksRetired = false;
   #semanticResultPersistenceFailed = false;
   #semanticResultFailures: Array<{
@@ -2239,7 +2255,7 @@ export class DurablePrpControlPlane {
       .then(() => connection.sendJson(frame))
       .catch(() => {
         if (checkpointFailure !== null && this.#protocolIntegrityError === null) {
-          this.#eventCommitFailed(connection, `checkpoint_flush_failed:${eventCommitFailureCause(checkpointFailure)}`);
+          this.#eventCommitFailed(connection, `checkpoint_flush_failed:${safeErrorCauseCode(checkpointFailure)}`);
         } else connection.close();
       });
     this.#sendQueues.set(connection, sending);
@@ -2320,7 +2336,9 @@ export class DurablePrpControlPlane {
           sourceEventId: event.sourceEventId, sourceEventType: event.eventType,
           correlation: { runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
             turnId: identity.turnId, itemId: event.itemId ?? identity.itemId } };
-        const outcome = await this.#recoverSemanticToolInput(call);
+        const admission: SemanticInputAdmission = this.#liveDispatchedSemanticCalls.has(commandId)
+          ? "this_controller" : "earlier_controller";
+        const outcome = await this.#recoverSemanticToolInput({ ...call, admission });
         if (this.#identity !== identity || this.#semanticCallbacksRetired || this.#retainsSourceInputs()) return;
         if (!outcome || this.#getCommand(commandId)) continue;
         const { input, ...metadata } = call;
@@ -3836,7 +3854,7 @@ export class DurablePrpControlPlane {
     try {
       this.#store.save();
     } catch (error) {
-      this.#failEventCommit(connection, `journal_write_failed:${eventCommitFailureCause(error)}`);
+      this.#failEventCommit(connection, `journal_write_failed:${safeErrorCauseCode(error)}`);
       return;
     }
     this.#sendJson(connection, {
@@ -4093,7 +4111,8 @@ export class DurablePrpControlPlane {
    * A rejected runner.suspend changes no provider state, and the runner keeps
    * serving this connection. Lift the terminal-lifecycle fence it installed
    * so the controller's next command (a fresh suspend) can be delivered.
-   * Completed suspensions and every shutdown keep the fence.
+   * Completed suspensions and every shutdown keep the fence. So does an
+   * indeterminate suspension: the Runner treats it as terminal and exits.
    */
   #releaseServingLifecycle(
     connection: AuthorityConnection,
@@ -4102,6 +4121,7 @@ export class DurablePrpControlPlane {
     if (
       command.type === "runner.suspend" &&
       (command.status === "failed" || command.status === "rejected") &&
+      !isIndeterminateCommandResult(command) &&
       connection.terminalLifecycleCommandId === command.commandId
     ) {
       connection.terminalLifecycleCommandId = null;
@@ -4150,7 +4170,11 @@ export class DurablePrpControlPlane {
           commandId: command.commandId,
           commandType: command.type,
           controllerSeq: command.controllerSeq,
-          status: command.status,
+          // A Runner journals a command it may have started before dying as
+          // `indeterminate` and sends it as `failed`. Runners compare this
+          // acknowledgement with their journal, so name that journal status;
+          // current Runners accept either spelling.
+          status: isIndeterminateCommandResult(command) ? "indeterminate" : command.status,
         },
       ),
     );
@@ -4330,7 +4354,7 @@ export class DurablePrpControlPlane {
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
-        this.#eventCommitFailed(connection, eventCommitFailureCause(error), sourceSeq);
+        this.#eventCommitFailed(connection, safeErrorCauseCode(error), sourceSeq);
       }
       return;
     }
@@ -4383,7 +4407,7 @@ export class DurablePrpControlPlane {
       try {
         this.#store.commit(candidate, !isStreamingEvent(event));
       } catch (error) {
-        this.#failEventCommit(connection, `journal_write_failed:${eventCommitFailureCause(error)}`, sourceSeq);
+        this.#failEventCommit(connection, `journal_write_failed:${safeErrorCauseCode(error)}`, sourceSeq);
         return;
       }
     } else {
@@ -4391,7 +4415,7 @@ export class DurablePrpControlPlane {
       try {
         committed = await this.#store.commitEvent(buildCandidate, isCurrentOwner, !isStreamingEvent(event));
       } catch (error) {
-        if (isCurrentOwner()) this.#failEventCommit(connection, `journal_write_failed:${eventCommitFailureCause(error)}`, sourceSeq);
+        if (isCurrentOwner()) this.#failEventCommit(connection, `journal_write_failed:${safeErrorCauseCode(error)}`, sourceSeq);
         else connection.close();
         return;
       }
@@ -4415,14 +4439,17 @@ export class DurablePrpControlPlane {
       && !this.#getCommand(liveCommandId) && !this.#pendingSemanticCalls.has(liveCommandId);
     // Reserve the original callback before exposing its checkpoint wait to
     // recovery. A missing saved outcome must never suppress first dispatch.
-    if (ownsLiveDispatch) this.#pendingSemanticCalls.add(liveCommandId!);
+    if (ownsLiveDispatch) {
+      this.#pendingSemanticCalls.add(liveCommandId!);
+      this.#liveDispatchedSemanticCalls.add(liveCommandId!);
+    }
     let dispatched = false;
     try {
       try {
         await this.flushCheckpoint();
       } catch (error) {
         if (this.#eventOwner === connection && this.#identity === identity) {
-          this.#eventCommitFailed(connection, `checkpoint_flush_failed:${eventCommitFailureCause(error)}`, sourceSeq);
+          this.#eventCommitFailed(connection, `checkpoint_flush_failed:${safeErrorCauseCode(error)}`, sourceSeq);
         }
         return;
       }
@@ -4455,6 +4482,8 @@ export class DurablePrpControlPlane {
               commandId,
               true,
             );
+            // Its journaled result settles it; recovery never asks again.
+            this.#liveDispatchedSemanticCalls.delete(commandId);
           } catch (error) {
             // A result that cannot fit the bounded durable journal cannot be
             // acknowledged as a usable tool response. Force a reconnect so

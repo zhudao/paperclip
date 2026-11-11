@@ -20,6 +20,7 @@ import { captureRemoteWorkspaceFiles, readRemoteWorkspaceFile } from "./remote-w
 import { taskFaultSchedule } from "./scheduler.js";
 import { g1ChildTitle, g1Decision, workloadDefinitions, type WorkloadAgents } from "./workloads.js";
 import { databaseUrlFromConfig, journeyDriverFor, type JourneyDriver } from "./journey-driver.js";
+import { withLiveStatusEvidence } from "./live-status-evidence.js";
 
 const IGNORED_DIRECTORIES = new Set([".git", ".bench", "__pycache__", "node_modules"]);
 const MAX_SNAPSHOT_FILES = 2_000;
@@ -82,7 +83,9 @@ export function toRunSample(run: Json): RunSample {
   const wake = new Set([...list(run.wakeCommentIds), ...(typeof run.wakeCommentId === "string" ? [run.wakeCommentId] : [])]);
   return {
     id: String(run.runId ?? run.id), status: String(run.status), createdAt: run.createdAt ?? null, startedAt: run.startedAt ?? null,
-    finishedAt: run.finishedAt ?? null, errorCode: run.errorCode ?? null, retryOfRunId: run.retryOfRunId ?? null,
+    finishedAt: run.finishedAt ?? null, errorCode: run.errorCode ?? null,
+    ...(typeof run.failureCause === "string" && run.failureCause ? { failureCause: run.failureCause } : {}),
+    retryOfRunId: run.retryOfRunId ?? null,
     wakeCommentIds: [...wake], livenessState: run.livenessState ?? null,
     lastEvidenceAt: latestIso([run.startedAt, run.lastUsefulActionAt, run.execution?.lastConfirmedActivityAt]),
   };
@@ -95,24 +98,29 @@ interface RunEventCursor {
   openTools: number;
   /** The run's latest recorded local runner process, until recovery reports it stopped. */
   process: { pid: number; startedAt: string } | null;
+  /** A provider turn started and has no turn terminal yet. */
+  turnActive?: boolean;
 }
 
 /** R5 liveness: a tool in flight, or a recorded local runner process. */
 export function noteLivenessEvent(cursor: RunEventCursor, event: Json) {
   const payload = (event.payload ?? {}) as Json;
   switch (event.eventType) {
+    case "turn.started": cursor.turnActive = true; break;
+    case "turn.completed": case "turn.failed": case "turn.cancelled": case "turn.interrupted":
+      cursor.turnActive = false; break;
     case "tool.execution.started": cursor.openTools += 1; break;
     case "tool.execution.completed": cursor.openTools = Math.max(0, cursor.openTools - 1); break;
     case "native.process_identity_recorded":
       if (payload.targetKind === "local" && Number.isSafeInteger(payload.processPid) && typeof payload.processStartedAt === "string") {
-        // A replacement runner cannot finish a tool its predecessor started.
-        if (cursor.process && cursor.process.pid !== payload.processPid) cursor.openTools = 0;
+        // A replacement runner cannot finish a tool or turn its predecessor started.
+        if (cursor.process && cursor.process.pid !== payload.processPid) { cursor.openTools = 0; cursor.turnActive = false; }
         cursor.process = { pid: payload.processPid, startedAt: payload.processStartedAt };
       }
       break;
     case "native.local_process_stopped":
-      // A stopped runner's in-flight tools can never send their completion.
-      if (cursor.process && payload.processPid === cursor.process.pid) { cursor.process = null; cursor.openTools = 0; }
+      // A stopped runner's in-flight tools and turn can never send their completion.
+      if (cursor.process && payload.processPid === cursor.process.pid) { cursor.process = null; cursor.openTools = 0; cursor.turnActive = false; }
       break;
   }
 }
@@ -159,6 +167,17 @@ export function toInterruption(value: Json | null | undefined): InterruptionSamp
 }
 
 /** Rest = no live run and nothing the system itself is still doing. */
+/**
+ * When a board Stop (S1) fires. A provider message fault (PV) needs the Stop's
+ * interrupt to reach a live provider turn, so it fires on the first sample that
+ * shows one, not after the seeded wall-clock window: a fast agent can finish
+ * before that window and leave the fault uninjected. Other tasks keep the window.
+ */
+export function stopArmed(input: { now: number; windowAt: number; providerFault: boolean; running: RunSample | undefined }): boolean {
+  if (input.providerFault) return Boolean(input.running?.providerTurnActive);
+  return input.now >= input.windowAt;
+}
+
 export function isResting(sample: TaskSample): boolean {
   if (!sample.reachable || !sample.serverReady) return false;
   if ((sample.runs ?? []).some(run => ACTIVE_RUN_STATUSES.has(run.status))) return false;
@@ -363,6 +382,7 @@ export class TaskObserver {
         return queued && !started ? first.at : "missed";
       }
       case "tool": return this.record.benchFirstSeenAt ?? null;
+      case "provider": return this.record.providerFaultAppliedAt ?? null;
       case "approval": return this.record.governance?.approvalSeenAt ?? null;
       case "paused": return this.record.governance?.budgetPausedAt ?? null;
       // Q1 keeps its own record (question-handoff.ts); Q2 and Q3 use the journey driver.
@@ -513,6 +533,7 @@ export class TaskObserver {
     this.runEventCursors.set(run.id, cursor);
     return { ...run, lastEvidenceAt: latestIso([run.lastEvidenceAt, cursor.lastAt]),
       ...(cursor.openTools > 0 ? { toolInFlight: true } : {}),
+      ...(cursor.turnActive ? { providerTurnActive: true } : {}),
       ...(cursor.process && this.processAlive(cursor.process.pid, cursor.process.startedAt) ? { processAlive: true } : {}) };
   }
 
@@ -528,7 +549,7 @@ export class TaskObserver {
         interruption: toInterruption(issue.interruption), activeRecoveryAction: Boolean(issue.activeRecoveryAction),
         recoveryOwner: issue.activeRecoveryAction?.ownerType ?? null,
         executionBlocker: Boolean(issue.executionBlocker), scheduledRetry: Boolean(issue.scheduledRetry),
-        runs: await Promise.all((runs ?? []).map(toRunSample).map(run => this.runEvidence(run))) };
+        runs: await withLiveStatusEvidence(this.api, this.record.issueId!, await Promise.all((runs ?? []).map(toRunSample).map(run => this.runEvidence(run)))) };
     } catch {
       return { at: now, reachable: false, serverReady: false };
     }
@@ -536,8 +557,12 @@ export class TaskObserver {
 
   private async maybeStop(sample: TaskSample, now: number): Promise<boolean> {
     if (!this.definition.stopBeforeFollowUp || this.record.stop || this.plan.followUpAfterMs === null || !sample.serverReady) return false;
-    if (now < this.record.createdAt! + this.plan.followUpAfterMs) return false;
+    const windowAt = this.record.createdAt! + this.plan.followUpAfterMs;
     const running = (sample.runs ?? []).find(run => run.status === "running");
+    if (!stopArmed({ now, windowAt, providerFault: Boolean(this.plan.providerFault), running })) {
+      // A PV Stop still waits for a live turn; it counts as missed only once the task rests after the window.
+      if (!this.plan.providerFault || now < windowAt || running || !isResting(sample)) return false;
+    }
     if (!running) {
       if (!isResting(sample)) return false;
       this.record.stop = { at: now, runId: null, httpStatus: null, error: null, missed: true };
@@ -692,7 +717,9 @@ export class TaskObserver {
     const attempt: RetryAttempt = { at: now, observedRunId, httpStatus: null, accepted: null, error: null };
     if (this.board) {
       const click = await this.board.clickRetry(issueRef, issueId);
-      Object.assign(attempt, { via: "ui", httpStatus: click.httpStatus, accepted: click.accepted, error: click.error, bannerText: click.bannerText });
+      Object.assign(attempt, { via: "ui", httpStatus: click.httpStatus, accepted: click.accepted, error: click.error, bannerText: click.bannerText,
+        ...(click.diagnostics !== undefined ? { diagnostics: click.diagnostics } : {}),
+        ...(click.dismissedDialogs?.length ? { dismissedDialogs: click.dismissedDialogs } : {}) });
       if (click.accepted) attempt.acceptedAt = Math.max(now, Date.now());
       return attempt;
     }

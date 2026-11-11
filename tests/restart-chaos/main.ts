@@ -15,9 +15,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ChaosApi, isSocketTypeOfServiceRace } from "./api.js";
 import { BoardUi } from "./board-ui.js";
 import { DEFAULT_MINIO_BINARY, MINIO_RELEASE, minioBinary, objectStoreServerEnvironment, startMinio, type ObjectStore } from "./object-store.js";
-import { StorageChaos, planStorageFaults, replayStorageWindows, type StorageFaultReceipt } from "./storage-chaos.js";
+import { StorageChaos, planStorageFaults, replayStorageWindows, type StorageFaultReceipt, type StorageFaultWindow } from "./storage-chaos.js";
 import { startStorageFaultProxy } from "./storage-proxy.js";
+import { StorageAuditor, auditsStorage, storageAuditMarkdown } from "./storage-audit.js";
+import { exposedAfterLaunch, StorageTrigger, storageTriggerMarkdown, storageTriggerShortfall } from "./storage-trigger.js";
+import { NativeTrigger, nativeTriggerMarkdown, nativeTriggerShortfall, triggeredOutageWindow } from "./native-trigger.js";
+import { needsCredentialRotation, startCredentialRotation, type CredentialRotation } from "./storage-credentials.js";
 import { describeProviderFault, installProviderFaultSeam, resolveRealCodex, withProviderFaultCheck, type ProviderFaultSeam } from "./provider-faults.js";
+import { installAcpxSidecarSeam, withAcpxSidecarHook, type AcpxSidecarSeam } from "./acpx-provider-faults.js";
 import { CREDENTIAL_FOR_ADAPTER, parseCommand, replayCommand, waveIdFor } from "./config.js";
 import { assertControllerMatchesImage, defaultDaytonaImageCacheRoot, prepareDaytonaImageArtifacts } from "./daytona-image.js";
 import { PLUGIN_BUILD_STAMP, pluginBuildState } from "./plugin-build.js";
@@ -33,12 +38,15 @@ import { collectWaveSpeed, speedMarkdown } from "./wave-speed.js";
 import { TaskObserver, childSpeedTasksInTurn } from "./observer.js";
 import { closeJourneyApps } from "./journey-driver.js";
 import { matrixMayLaunch, planMatrixWave } from "./journey-matrix.js";
+import { redeployWave } from "./redeploy.js";
 import { StormRun, TASK_FAULT_LOG, observedFaultSchedule, planWave, replayOnCurrentBuild, replayRecordFor, replayWave, type TaskFaultLog } from "./scheduler.js";
 import { chaosLifecycleOverrides, seedChaosLab } from "./seed.js";
 import { ChaosSupervisor } from "./supervisor.js";
 import { TimeShiftedApi } from "./time-faults.js";
+import type { RestartStep } from "./repeated-restarts.js";
 import { isBrokenStdoutError, markTimelineEchoBroken, Timeline } from "./timeline.js";
 import { guardedRunnerOutputs, worktreeFingerprint } from "./wave-guard.js";
+import { checkCrossServer, readCrossServerEvidence } from "./multi-server.js";
 import type { FaultKind, FaultReceipt, OracleArtifacts, TriggerId, WavePlan } from "./types.js";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
@@ -193,7 +201,9 @@ async function main(): Promise<number> {
   const batchSize = crashPoints.length ? Math.max(1, Math.floor(plan.tasks.length / crashPoints.length)) : 0;
   if (crashPoint && plan.tasks.length !== batchSize * crashPoints.length) throw new Error(`--tasks must be a multiple of the ${crashPoints.length} crash point(s)`);
   const supervisor = await ChaosSupervisor.create({ repositoryRoot, waveDir, timeline,
-    ...(plan.options.upgradeFrom ?? plan.options.serverFrom ? { upgradeFrom: plan.options.upgradeFrom ?? plan.options.serverFrom } : {}) });
+    ...(plan.options.upgradeFrom ?? plan.options.serverFrom ? { upgradeFrom: plan.options.upgradeFrom ?? plan.options.serverFrom } : {}),
+    // K15: every server of the wave runs under an emulated deploy identity; a replay derives the source wave's ones.
+    ...(redeployWave(plan) ? { redeployWaveId: plan.replayOf?.waveId ?? plan.waveId } : {}) });
   // Crash-point suite: one booted server, one point at a time. Each point gets
   // its own batch of tasks; the point is armed once the batch launched and the
   // server kills itself at its nth hit (restarted like K1). Invariants are
@@ -247,9 +257,15 @@ async function main(): Promise<number> {
   let board: BoardUi | null = null;
   let objectStore: ObjectStore | null = null;
   let storageChaos: StorageChaos | null = null;
+  let storageTrigger: StorageTrigger | null = null;
+  let nativeTrigger: NativeTrigger | null = null;
   let storageProxy: Awaited<ReturnType<typeof startStorageFaultProxy>> | null = null;
+  let credentialRotation: CredentialRotation | null = null;
+  let storageAuditor: StorageAuditor | null = null;
   let providerFaults: ProviderFaultSeam | null = null;
+  let acpxSidecarSeam: AcpxSidecarSeam | null = null;
   let speedSection: string | null = null;
+  let storageSection: string | null = null;
   let harnessError: unknown;
   process.on("uncaughtException", error => {
     if (isSocketTypeOfServiceRace(error)) { timeline.add("harness_socket_race_ignored", { error: String(error) }); return; }
@@ -280,26 +296,44 @@ async function main(): Promise<number> {
       if (!binary) throw new Error(`--storage s3 needs MinIO ${MINIO_RELEASE} at ${DEFAULT_MINIO_BINARY} or RESTART_CHAOS_MINIO_BIN`);
       objectStore = await startMinio({ binary, root: supervisor.paths.temporaryRoot });
       storageProxy = await startStorageFaultProxy(objectStore.endpoint);
+      if (auditsStorage(plan.options)) storageAuditor = new StorageAuditor(objectStore, `chaos/${plan.waveId}/`);
       Object.assign(serverEnvironment, objectStoreServerEnvironment(objectStore, storageProxy.endpoint, `chaos/${plan.waveId}/`));
+      if (needsCredentialRotation(plan.options)) {
+        const rotating = await startCredentialRotation({ store: objectStore, binary, root: supervisor.paths.temporaryRoot, record: (kind, data) => timeline.add(kind, data) });
+        credentialRotation = rotating.rotation;
+        Object.assign(serverEnvironment, rotating.environment);
+      }
       timeline.add("object_store_started", { release: MINIO_RELEASE, endpoint: objectStore.endpoint, proxy: storageProxy.endpoint, bucket: objectStore.bucket });
     }
     if (plan.tasks.some(task => task.providerFault)) {
       // PV1–PV3: route the server's Codex launches through the fault shim (no product change).
-      const realCodex = resolveRealCodex(repositoryRoot);
+      // The provider the server actually runs: `--server-from` serves another checkout.
+      const realCodex = resolveRealCodex(plan.options.serverFrom ?? repositoryRoot);
       providerFaults = await installProviderFaultSeam({ root: supervisor.paths.temporaryRoot, logPath: path.join(waveDir, "provider-faults.jsonl"),
         realCommand: realCodex.command, realVersion: realCodex.version, realManifestPath: realCodex.manifestPath,
         ...(process.env.NODE_OPTIONS ? { inheritedNodeOptions: process.env.NODE_OPTIONS } : {}) });
       await providerFaults.arm(plan.tasks);
       Object.assign(serverEnvironment, providerFaults.serverEnvironment);
+      if (plan.tasks.some(task => task.providerFault && task.adapter === "claude")) {
+        // Claude (ACPX): the stand-in sidecar taps the verified provider's pipe (acpx-provider-faults.ts).
+        // The seam must mirror the runner the server actually loads (`--server-from` runs another checkout).
+        acpxSidecarSeam = await installAcpxSidecarSeam({ repositoryRoot: plan.options.serverFrom ?? repositoryRoot, waveId: plan.waveId, controlPath: providerFaults.controlPath,
+          logPath: providerFaults.logPath, stateDirectory: providerFaults.stateDirectory });
+        Object.assign(serverEnvironment, acpxSidecarSeam.serverEnvironment,
+          { NODE_OPTIONS: withAcpxSidecarHook(serverEnvironment.NODE_OPTIONS) });
+        timeline.add("acpx_provider_faults_installed", { standInRoot: acpxSidecarSeam.standInRoot, realSidecar: acpxSidecarSeam.realSidecar });
+      }
       timeline.add("provider_faults_installed", { realCodex: realCodex.command, codexVersion: realCodex.version,
         rules: plan.tasks.flatMap(task => task.providerFault ? [`${task.taskId}:${describeProviderFault(task.providerFault)}`] : []) });
     }
     if (plan.options.timeAgeMs) supervisor.timeAgeMs = plan.options.timeAgeMs;
+    if (plan.options.rrStopOn) supervisor.rrStopOn = plan.options.rrStopOn;
     await supervisor.start(serverEnvironment);
     // TM2/TM3 age the database; the observer and grader read run times back at their real times.
     const api: ChaosApi = new TimeShiftedApi(supervisor.baseUrl, supervisor.agingShifts);
     const lab = await seedChaosLab({ api, env: plan.options.env, waitForReadyAgents: true, cancelled: () => interrupted, daytonaImage: plan.options.daytonaImage, daytonaCpu: plan.options.daytonaCpu,
       daytonaReuseLease: plan.options.daytonaReuseLease,
+      daytonaWarm: plan.options.daytonaWarm, daytonaInherit: plan.options.daytonaInherit,
       adapters: [...new Set([...plan.tasks.map(task => task.adapter),
         ...(plan.tasks.some(task => task.workload === "M1") ? plan.options.adapters : [])])],
       concurrency: plan.options.concurrency, budgetCents: plan.options.budgetCents, masks: plan.options.masks,
@@ -317,7 +351,8 @@ async function main(): Promise<number> {
     }
     // The instance root holds the secrets master key and the database: oracle code may not read it.
     const protectedRoots = [os.homedir(), supervisor.paths.temporaryRoot, resultsRoot];
-    board = serverEnvironment.SERVE_UI === "false" ? null : new BoardUi(supervisor.baseUrl);
+    board = serverEnvironment.SERVE_UI === "false" ? null
+      : new BoardUi(supervisor.baseUrl, undefined, path.join(waveDir, "ui-retry-diagnostics"));
     const observers = plan.tasks.map(task => new TaskObserver(task, api, lab, timeline, supervisor, protectedRoots, board));
     const pending = [...observers];
     const launched: TaskObserver[] = [];
@@ -329,16 +364,16 @@ async function main(): Promise<number> {
     if (storageProxy && (plan.options.storageWindows?.length || plan.options.storageFaults?.length)) {
       const windows = plan.options.storageWindows ?? planStorageFaults({ kinds: plan.options.storageFaults!, seed: plan.seed,
         spanMs: plan.storm?.durationMs ?? plan.tasks.length * 4 * 60_000, ...(plan.options.storageFaultMs ? { durationMs: plan.options.storageFaultMs } : {}) });
-      storageChaos = new StorageChaos(windows, Date.now(), storageProxy, (kind, data) => timeline.add(kind, data));
+      storageChaos = new StorageChaos(windows, Date.now(), credentialRotation?.wrap(storageProxy) ?? storageProxy, (kind, data) => timeline.add(kind, data));
       if (!plan.options.storageWindows) storageChaos.start();
       timeline.add("storage_faults_planned", { windows: windows.map(window => `${window.kind}@${window.startMs}ms+${window.durationMs}ms`) });
     }
     if (storm) timeline.add("storm_started", { durationMs: storm.plan.durationMs, plannedFaults: storm.plan.faults.length });
     // Faults are serialized; each one hits every task in flight when it starts.
     const fireFault = (kind: FaultKind, holdMs: number, requestedBy: string, exposed: readonly TaskObserver[],
-      trigger?: { trigger: TriggerId; delayMs: number }, onSettled?: () => void) => {
+      trigger?: { trigger: TriggerId; delayMs: number }, onSettled?: () => void, restartSteps?: RestartStep[]) => {
       faultsQueued += 1;
-      faultWork.push(supervisor.fault(kind, holdMs, requestedBy, trigger).finally(() => { faultsQueued -= 1; onSettled?.(); }).then(receipt => {
+      faultWork.push(supervisor.fault(kind, holdMs, requestedBy, trigger, restartSteps).finally(() => { faultsQueued -= 1; onSettled?.(); }).then(receipt => {
         faults.push(receipt);
         checkWorktree(receipt.faultId);
         for (const candidate of exposed) {
@@ -364,6 +399,61 @@ async function main(): Promise<number> {
         timeline.add("fault_error", { taskId: requestedBy, error: error.message });
       }));
     };
+
+    let launching: Promise<void> | null = null;
+    if (storageProxy && plan.options.storageTrigger) {
+      storageTrigger = new StorageTrigger(plan.options.storageTrigger, {
+        canFire: () => !interrupted && !faultsQueued && !supervisor.faultInProgress && supervisor.serverReady,
+        isOpen: taskId => observers.some(observer => observer.plan.taskId === taskId && !observer.done && observer.record.restAt === null),
+        record: (kind, data) => timeline.add(kind, data),
+        fire: armed => {
+          faultsQueued += 1;
+          const work = (async () => {
+            const exposed = await exposedAfterLaunch(launching, launched);
+            await Promise.all(exposed.map(candidate => candidate.snapshotBeforeFault()));
+            const queued = faultWork.length;
+            fireFault(armed.kind, armed.holdMs, armed.taskId, exposed, undefined, undefined, armed.restartSteps);
+            await faultWork[queued];
+          })().finally(() => { faultsQueued -= 1; });
+          faultWork.push(work);
+          return work;
+        },
+      });
+      storageProxy.observe(storageTrigger.listener);
+    }
+    const outageMs = plan.options.nativeTrigger?.outageMs;
+    const outageWindows: StorageFaultWindow[] = [];
+    const outageClock = Date.now();
+    if (outageMs && storageProxy && !storageChaos && !plan.replayOf) {
+      storageChaos = new StorageChaos(outageWindows, outageClock, credentialRotation?.wrap(storageProxy) ?? storageProxy, (kind, data) => timeline.add(kind, data));
+      storageChaos.start(1_000, outageClock);
+    }
+    if (plan.options.nativeTrigger && !plan.replayOf) {
+      nativeTrigger = new NativeTrigger(plan.options.nativeTrigger, {
+        canFire: () => !interrupted && !faultsQueued && !supervisor.faultInProgress && supervisor.serverReady,
+        isOpen: taskId => observers.some(observer => observer.plan.taskId === taskId && !observer.done && observer.record.restAt === null),
+        issueId: taskId => observers.find(observer => observer.plan.taskId === taskId)?.record.issueId ?? null,
+        runs: issueId => api.get<unknown[]>(`/api/issues/${issueId}/runs`, 5_000),
+        events: (runId, afterSeq, limit) => api.get(`/api/heartbeat-runs/${runId}/events?afterSeq=${afterSeq}&limit=${limit}`, 5_000),
+        record: (kind, data) => timeline.add(kind, data),
+        fire: armed => {
+          faultsQueued += 1;
+          const work = (async () => {
+            const exposed = await exposedAfterLaunch(launching, launched);
+            await Promise.all(exposed.map(candidate => candidate.snapshotBeforeFault()));
+            const queued = faultWork.length;
+            if (outageMs) {
+              outageWindows.push(triggeredOutageWindow(Date.now() - outageClock, outageMs));
+              storageChaos?.tick();
+            }
+            fireFault(armed.kind, armed.holdMs, armed.taskId, exposed, undefined, undefined, armed.restartSteps);
+            await faultWork[queued];
+          })().finally(() => { faultsQueued -= 1; });
+          faultWork.push(work);
+          return work;
+        },
+      });
+    }
 
     supervisor.onCrashPoint = receipt => {
       const owner = pointResults.find(result => result.token === receipt.crashPoint?.token);
@@ -417,8 +507,9 @@ async function main(): Promise<number> {
         errors: check.errors.map(error => redactKnownSecrets(error, knownSecretValues())) });
     };
 
-    while (!interrupted && (pending.length || active.length)) {
+    while (!interrupted && (pending.length || active.length || storageTrigger?.busy || nativeTrigger?.busy)) {
       const now = Date.now();
+      await nativeTrigger?.tick(now);
       if (storm?.endIfDue(now)) {
         // Unlaunched pool tasks are not part of the wave; the in-flight ones drain without new faults.
         timeline.add("storm_ended", { faultsFired: storm.state.fired, inFlight: active.length, unlaunched: pending.length });
@@ -435,15 +526,26 @@ async function main(): Promise<number> {
         }
       }
       // Recheck the storm clock per launch: ensureServing or a slow launch can cross the storm's end.
-      while (!crashPoint && active.length < plan.options.concurrency && pending.length && supervisor.serverReady && !supervisor.faultInProgress
+      while (!crashPoint && active.length < plan.options.concurrency && pending.length && supervisor.serverReady && !supervisor.faultInProgress && !storageTrigger?.busy && !nativeTrigger?.busy
         && (!storm || storm.mayLaunch(Date.now()))
         // `--matrix`: no-fault baselines never share the server with a fault cell.
         && (!plan.options.matrix || matrixMayLaunch(pending[0]!.plan, active.filter(observer => !observer.done).map(observer => observer.plan)))) {
         const next = pending.shift()!;
         launched.push(next);
-        await next.launch();
+        launching = next.launch().finally(() => { launching = null; });
+        await launching;
         if (plan.options.storageWindows && storageChaos && launched.length === 1) storageChaos.start();
         if (!next.done) active.push(next);
+      }
+      // `--provider-fault-restart`: a task's K1 is armed once the shim logged its fault.
+      if (providerFaults) {
+        for (const observer of active) {
+          if (!observer.plan.providerFault?.restart || observer.record.providerFaultAppliedAt !== undefined) continue;
+          const rule = observer.plan.providerFault;
+          const applied = (await providerFaults.eventsFor(observer.plan.nonce))
+            .find(event => event.event === "applied" && event.kind === rule.kind && event.message === rule.message);
+          if (applied) observer.record.providerFaultAppliedAt = applied.at;
+        }
       }
       await Promise.all(active.filter(observer => now - (lastPoll.get(observer) ?? 0) >= plan.options.pollMs).map(async observer => {
         lastPoll.set(observer, now);
@@ -458,6 +560,8 @@ async function main(): Promise<number> {
         const due = observer.faultDue(Date.now());
         if (!due) continue;
         if (observer.record.restAt !== null) { timeline.add("fault_skipped_task_resting", { taskId: observer.plan.taskId, fault: due.kind }); continue; }
+        if (nativeTrigger) { nativeTrigger.arm({ taskId: observer.plan.taskId, kind: due.kind, holdMs: due.holdMs, armedAt: Date.now(), ...(due.restartSteps ? { restartSteps: due.restartSteps } : {}) }); continue; }
+        if (storageTrigger) { storageTrigger.arm({ taskId: observer.plan.taskId, kind: due.kind, holdMs: due.holdMs, armedAt: Date.now(), ...(due.restartSteps ? { restartSteps: due.restartSteps } : {}) }); continue; }
         const exposed = active.filter(candidate => !candidate.done);
         await Promise.all(exposed.map(candidate => candidate.snapshotBeforeFault()));
         if (!(await observer.confirmTrigger(due, Date.now()))) continue;
@@ -469,7 +573,7 @@ async function main(): Promise<number> {
         const trigger = due.trigger && due.trigger !== "time" ? { trigger: due.trigger, delayMs: due.delayMs ?? 0 } : undefined;
         if (trigger) timeline.add("trigger_fired", { taskId: observer.plan.taskId, fault: due.kind, ...trigger });
         // Inside a storm a triggered fault is a restart too: the next storm gap runs from its settle.
-        fireFault(due.kind, due.holdMs, observer.plan.taskId, exposed, trigger, storm ? () => storm.settled(Date.now()) : undefined);
+        fireFault(due.kind, due.holdMs, observer.plan.taskId, exposed, trigger, storm ? () => storm.settled(Date.now()) : undefined, due.restartSteps);
       }
       if (storm && !faultsQueued && !supervisor.faultInProgress && supervisor.serverReady) {
         const due = storm.due(Date.now());
@@ -489,6 +593,18 @@ async function main(): Promise<number> {
       await delay(1_000);
     }
     await Promise.all(faultWork);
+    if (storageTrigger) {
+      const shortfall = storageTriggerShortfall(storageTrigger.finish(faults));
+      storageSection = storageTriggerMarkdown(storageTrigger.receipts);
+      timeline.add("storage_trigger_settled", { shortfall, receipts: storageTrigger.receipts.length });
+      if (shortfall) harnessError ??= new Error(shortfall);
+    }
+    if (nativeTrigger) {
+      const shortfall = nativeTriggerShortfall(nativeTrigger.finish(faults));
+      storageSection = [storageSection, nativeTriggerMarkdown(nativeTrigger.receipts)].filter(Boolean).join("\n");
+      timeline.add("native_trigger_settled", { shortfall, receipts: nativeTrigger.receipts.length });
+      if (shortfall) harnessError ??= new Error(shortfall);
+    }
     await stopPressure();
     checkWorktree("wave_end");
     if (worktreeChanged) harnessError ??= new Error("The worktree changed during the wave (build, install or branch switch); later restarts may have run different code");
@@ -543,7 +659,9 @@ async function main(): Promise<number> {
       const graded = artifacts ? observer.definition.grade(observer.plan.nonce, artifacts, observer.workloadAgents())
         : { verdict: "fail" as const, checks: [{ name: "artifacts_collected", ok: false, detail: observer.record.launchError ?? "collection failed" }] };
       // A provider-fault task whose fault never happened tested nothing.
-      const oracle = withProviderFaultCheck(graded, observer.plan, artifacts?.providerFaultEvents ?? []);
+      const restart = faults.find(receipt => receipt.requestedBy === observer.plan.taskId && receipt.trigger === "provider");
+      const oracle = withProviderFaultCheck(graded, observer.plan, artifacts?.providerFaultEvents ?? [], restart?.startedAt ?? null,
+        restart?.stoppedAt ?? restart?.startedAt ?? null);
       const grade = gradeTask(observer.record, faults, observer.definition.budgetMs, oracle, universalByIssue ? {
         runMessages: allRunMessages, recoveryActions: universalByIssue.get(observer.record.issueId ?? "")?.recoveryActions ?? [] } : undefined);
       let evidence: string | null = null;
@@ -559,12 +677,29 @@ async function main(): Promise<number> {
         rules: Object.fromEntries(Object.entries(grade.rules).map(([id, rule]) => [id, rule.verdict])), T: grade.T.verdict,
         universal: Object.fromEntries(Object.entries(grade.universal ?? {}).map(([id, rule]) => [id, `${rule.verdict}${rule.enforced ? "" : " (warning)"}`])) });
     }
+    // MS1–MS3: the cross-server invariant over the whole wave (multi-server.ts).
+    if (faults.some(receipt => receipt.multiServer)) {
+      const crossServer = await readCrossServerEvidence(evidenceDb, lab.companyId)
+        .then(evidence => checkCrossServer({ ...evidence, windows: supervisor.serverWindows }))
+        .catch(error => { harnessError ??= new Error(`Cross-server invariant check failed: ${String(error)}`); return null; });
+      if (crossServer) {
+        await writeFile(path.join(waveDir, "cross-server.json"), `${JSON.stringify(crossServer, null, 2)}\n`, { mode: 0o600 });
+        timeline.add("cross_server_invariant", { violations: crossServer.violations.map(violation => ({ rule: violation.rule, runId: violation.runId,
+          issueId: violation.issueId, detail: violation.detail })), unattributed: crossServer.unattributed.length });
+        if (crossServer.violations.length) anyFailure = true;
+      }
+    }
+    if (storageAuditor) {
+      storageChaos?.stop();
+      await credentialRotation?.settled();
+      await storageAuditor.checkSnapshots(evidenceDb, lab.companyId);
+    }
     await evidenceDb.$client.end({ timeout: 5 }).catch(() => undefined);
     await writeFile(path.join(waveDir, "faults.json"), `${JSON.stringify(faults, null, 2)}\n`, { mode: 0o600 });
     const speed = await (async () => {
       const childTasks = await childSpeedTasksInTurn(launched);
       return collectWaveSpeed(api, plan.options.env, [...launched.flatMap(observer => observer.record.issueId
-        ? [{ issueId: observer.record.issueId, adapter: observer.plan.adapter, samples: observer.record.samples }] : []), ...childTasks], faults);
+        ? [{ issueId: observer.record.issueId, adapter: observer.plan.adapter, samples: observer.record.samples }] : []), ...childTasks], faults, storageChaos?.receipts ?? []);
     })().catch(error => { timeline.add("wave_speed_failed", { error: String(error) }); anyFailure = true; return null; });
     if (speed) {
       speedSection = speedMarkdown(speed);
@@ -650,19 +785,32 @@ async function main(): Promise<number> {
       }
     }
     storageChaos?.stop();
+    await credentialRotation?.settled();
+    if (credentialRotation?.failures.length) harnessError ??= new Error(`ST5R credential rotation failed: ${credentialRotation.failures.join("; ")}`);
+    if (nativeTrigger) await writeFile(path.join(waveDir, "native-trigger.json"), `${JSON.stringify(nativeTrigger.finish(faults), null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
     if (storageProxy) {
+      storageProxy.observe(null);
+      if (storageTrigger) await writeFile(path.join(waveDir, "storage-trigger.json"), `${JSON.stringify(storageTrigger.finish(faults), null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
       if (storageChaos) await writeFile(path.join(waveDir, "storage-faults.json"), `${JSON.stringify(storageChaos.receipts, null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
       await writeFile(path.join(waveDir, "storage-proxy.json"), `${JSON.stringify(storageProxy.counts(), null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
       await storageProxy.close().catch(() => undefined);
     }
+    if (storageAuditor) {
+      const failures = await storageAuditor.finish(waveDir, { kinds: storageChaos?.windows.map(window => window.kind) ?? [],
+        injectedBy: storageProxy?.counts().injectedBy }).catch(error => [`storage audit failed: ${String(error)}`]);
+      timeline.add("storage_audit", { ...storageAuditor.audit, failures });
+      if (failures.length) anyFailure = true;
+      speedSection = `${speedSection ?? ""}\n${storageAuditMarkdown(storageAuditor.audit)}`;
+    }
     await objectStore?.stop().catch(error => timeline.add("object_store_stop_failed", { error: String(error) }));
+    await acpxSidecarSeam?.remove().catch(error => timeline.add("acpx_stand_in_cleanup_failed", { error: String(error) }));
     const retention = await releaseInstance(supervisor.paths.temporaryRoot, { keep, stopFailed, remoteCleanupPending, owner: plan.waveId })
       .catch(error => { timeline.add("instance_cleanup_failed", { error: String(error) }); return null; });
     if (retention?.kept) timeline.add("instance_kept", { temporaryRoot: supervisor.paths.temporaryRoot, reason: retention.reason });
     if (lines.length) {
       await appendLedger(resultsRoot, lines);
       const summary = await writeSummary(resultsRoot, plan.waveId);
-      await writeFile(path.join(waveDir, "SUMMARY.md"), speedSection ? `${summary}\n${speedSection}` : summary, { mode: 0o600 });
+      await writeFile(path.join(waveDir, "SUMMARY.md"), [summary, speedSection, storageSection].filter(Boolean).join("\n"), { mode: 0o600 });
       console.info(`\n${summary}`);
     }
   }
