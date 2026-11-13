@@ -1024,6 +1024,8 @@ function turnStartCommandResultValid(input: {
   );
 }
 
+type ControlPlaneRegistration = Awaited<ReturnType<NonNullable<RunnerExecutionDriver["controlPlaneRegistration"]>>>;
+
 type CloseCheckpointRetry = {
   checkpoint: () => Promise<void> | void;
   finish: (deadline: number) => Promise<void>;
@@ -1079,10 +1081,18 @@ async function awaitRunnerSuspensionBarrier(input: {
   readRunnerState: () => Promise<Record<string, unknown>>;
   runnerHasExited: () => Promise<boolean>;
   pump: () => void;
+  /** Called once the Runner's exit is certain: its suspend command completed. */
+  onExitCommitted?: () => void;
   deadline: number;
   pollIntervalMs?: number;
 }): Promise<boolean> {
   if (Date.now() >= input.deadline) return false;
+  let exitCommitted = false;
+  const commitExit = () => {
+    if (exitCommitted) return;
+    exitCommitted = true;
+    input.onExitCommitted?.();
+  };
   const readRunnerState = async (): Promise<Record<string, unknown> | undefined> => {
     const remainingMs = input.deadline - Date.now();
     if (remainingMs <= 0) return undefined;
@@ -1112,8 +1122,10 @@ async function awaitRunnerSuspensionBarrier(input: {
     try {
       const state = await readRunnerState();
       if (state === undefined) return false;
-      if (state.lifecycle === "suspended")
+      if (state.lifecycle === "suspended") {
+        commitExit();
         return Date.now() < input.deadline;
+      }
     } catch {
       // The normal bounded barrier below handles unavailable state.
     }
@@ -1156,6 +1168,9 @@ async function awaitRunnerSuspensionBarrier(input: {
       input.queueSuspend(commandId);
       continue;
     }
+    // The Runner exits right after it reports a completed suspend, so its exit
+    // is certain before this barrier reads the durable state.
+    if (command?.status === "completed") commitExit();
     let lifecycle: unknown;
     try {
       const state = await readRunnerState();
@@ -1729,9 +1744,9 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   }) => void | Promise<void>;
 }
 
-/** One measured local startup sub-step, named for the run-log span it becomes. */
+/** One measured startup sub-step, named for the run-log span it becomes. */
 export interface RunnerdStartupStep {
-  name: "runner.runtime.stage" | "runner.process.launch" | "provider.session.load";
+  name: "runner.control_plane.open" | "runner.runtime.stage" | "runner.process.launch" | "provider.session.load";
   mode: "bootstrap" | "resume";
   startedAtMs: number;
   endedAtMs: number;
@@ -4131,6 +4146,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     ((settlement: "settled" | "unsettled") => Promise<void> | void) | null =
     null;
   #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
+  /** Quiesce hooks of the registered routes that have not been released yet. */
+  readonly #controlPlaneQuiesces = new Set<() => void>();
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
@@ -4720,6 +4737,42 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
   }
 
+  async #registerControlPlane(
+    core: DurablePrpControlPlane,
+    identity?: DurableRecoveryIdentity,
+  ): Promise<ControlPlaneRegistration> {
+    const registration = await this.options.controlPlaneRegistration!(core, identity);
+    const quiesce = registration.quiesce;
+    if (!quiesce) return registration;
+    this.#controlPlaneQuiesces.add(quiesce);
+    // Copy descriptors so a registration's getters (such as a lazily created
+    // route's failure) stay live; only release changes.
+    const release = registration.release;
+    return Object.defineProperties({}, {
+      ...Object.getOwnPropertyDescriptors(registration),
+      release: {
+        enumerable: true,
+        value: (reason?: "detach") => {
+          this.#controlPlaneQuiesces.delete(quiesce);
+          return release.call(registration, reason);
+        },
+      },
+    }) as ControlPlaneRegistration;
+  }
+
+  /** The Runner's exit is committed: its routes' drops are no longer transport loss. */
+  #quiesceControlPlaneRoutes(): void {
+    const routes = [...this.#controlPlaneQuiesces];
+    this.#controlPlaneQuiesces.clear();
+    for (const quiesce of routes) {
+      try {
+        quiesce();
+      } catch (error) {
+        this.#diagnostic(`control-plane route quiesce failed: ${String(error)}`);
+      }
+    }
+  }
+
   #quietReleasedRunner(): void {
     this.#stopPump();
     if (this.#adoptedRunnerMonitor !== null) clearInterval(this.#adoptedRunnerMonitor);
@@ -4834,7 +4887,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     await this.#claimReleasedRunner(claimantRunId);
     const core = this.#core!;
     if (core.activeRunnerConnectionCount() !== 1) {
-      const registration = await this.options.controlPlaneRegistration?.(core, this.#releaseEpisode!.source);
+      const registration = this.options.controlPlaneRegistration
+        ? await this.#registerControlPlane(core, this.#releaseEpisode!.source) : undefined;
       try {
         this.#assertStartupOpen();
         if (!registration?.checkpoint) throw new Error("native_runner_released_cleanup_unavailable");
@@ -4949,7 +5003,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       itemId: input.itemId,
     };
     const registration = this.options.controlPlaneRegistration
-      ? await this.options.controlPlaneRegistration(core, desired)
+      ? await this.#registerControlPlane(core, desired)
       : null;
     const previousRelease = this.#controlPlaneRelease;
     let previousReleased = false;
@@ -5504,6 +5558,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return operation;
   }
 
+  async #refreshBootstrapTicket(core: DurablePrpControlPlane): Promise<string> {
+    this.#assertStartupOpen();
+    const ticket = core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS);
+    await core.flushCheckpoint();
+    this.#assertStartupOpen();
+    return ticket;
+  }
+
   #assertStartupOpen(): void {
     if (this.#closed) throw new Error("runnerd transport closed during provider startup");
   }
@@ -5627,21 +5689,32 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // the next runnerd on this root as a stale terminal command.
       const lostLocalRunner = this.#handle !== null && this.#lostRunnerHandle === this.#handle
         && !this.options.runnerProcessLauncher && !adoptedRunner;
-      runnerSuspended = !lostLocalRunner && await awaitRunnerSuspensionBarrier({
-        commands: () => this.#core?.store.state.commands ?? [],
-        queueSuspend: (commandId) => {
-          this.#core?.queueCommand("runner.suspend", {}, commandId, true);
-        },
-        readRunnerState: async () => {
-          const state = await this.#readDurableRunnerState();
-          lastSuspensionState = state;
-          assertSuspendedRunnerState(state, this.#core!.store.state.identity);
-          return state;
-        },
-        runnerHasExited: () => this.#runnerHasExited(),
-        pump: () => this.#pumpEventsSafely(),
-        deadline: closeDeadline,
-      });
+      // Quiesce before the authority acknowledges a completed suspend: the
+      // Runner exits on that acknowledgement, possibly while the barrier is
+      // still reading durable state, and a Core-dialed route would otherwise
+      // redial it. The release path quiesces its route the same way.
+      const stopObservingExit = this.#core.onRunnerExitCommitted(() => this.#quiesceControlPlaneRoutes());
+      try {
+        runnerSuspended = !lostLocalRunner && await awaitRunnerSuspensionBarrier({
+          commands: () => this.#core?.store.state.commands ?? [],
+          queueSuspend: (commandId) => {
+            this.#core?.queueCommand("runner.suspend", {}, commandId, true);
+          },
+          readRunnerState: async () => {
+            const state = await this.#readDurableRunnerState();
+            lastSuspensionState = state;
+            assertSuspendedRunnerState(state, this.#core!.store.state.identity);
+            return state;
+          },
+          runnerHasExited: () => this.#runnerHasExited(),
+          pump: () => this.#pumpEventsSafely(),
+          // Also covers a completed receipt acknowledged before this close.
+          onExitCommitted: () => this.#quiesceControlPlaneRoutes(),
+          deadline: closeDeadline,
+        });
+      } finally {
+        stopObservingExit();
+      }
       runnerLost = !runnerSuspended && this.#handle !== null && this.#lostRunnerHandle === this.#handle;
       if (!runnerSuspended) {
         const command = [...this.#core.store.state.commands].reverse().find(
@@ -6188,6 +6261,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await this.#resume();
       return this.#openedThreadResponse(params);
     }
+    this.#startupSteps?.begin("runner.control_plane.open");
     const token = randomUUID().replaceAll("-", "");
     const identity = this.options.prpIdentity ?? {
       runnerInstanceId: `runner_lab_${token}`,
@@ -6260,7 +6334,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#openingCommandId = opening?.commandId ?? null;
     }
     const registration = this.options.controlPlaneRegistration
-      ? await this.options.controlPlaneRegistration(core)
+      ? await this.#registerControlPlane(core)
       : null;
     this.#startupFailureCode =
       registration?.startupFailureCode ?? "runner_local_connect_failed";
@@ -6305,6 +6379,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       diagnosticsDirectory: resolve(this.#root, "diagnostics"),
       processLauncher: this.options.runnerProcessLauncher,
       isRunnerConnected: () => core.activeRunnerConnectionCount() > 0,
+      refreshBootstrapTicket: () => this.#refreshBootstrapTicket(core),
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -6812,6 +6887,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#core = core;
     this.#followCommittedEvents(core);
+    if (this.options.adoptExistingRunner) {
+      const withdrawn = core.withdrawUndeliveredTerminalCommands();
+      if (withdrawn.length > 0) {
+        this.#diagnostic(`withdrew ${withdrawn.join(", ")} queued by an earlier attempt before reattaching the live runner`);
+      }
+    }
     this.#carriedCommandCount = core.store.state.commands.length;
     // Reusing resources still requires current environment authorization. The
     // optional hook avoids re-preparation after controller storage is lost.
@@ -7024,9 +7105,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             && this.options.warmTransitionRegistrationMode === "routed_same_endpoint"))) {
           throw new Error("native_runner_warm_transition_requires_exact_owned_endpoint");
         }
-        oldTransitionRegistration = await this.options.controlPlaneRegistration(core, recoverySource);
+        oldTransitionRegistration = await this.#registerControlPlane(core, recoverySource);
         this.#assertStartupOpen();
-        newTransitionRegistration = await this.options.controlPlaneRegistration(core, recoveryTarget);
+        newTransitionRegistration = await this.#registerControlPlane(core, recoveryTarget);
         const connection = newTransitionRegistration.connection ?? { mode: "connect", connectUrl: newTransitionRegistration.connectUrl };
         if (durableRecoveryInternals.canonicalJson(connection) !== durableRecoveryInternals.canonicalJson(expectedRecoveryConnection)) {
           throw new Error("native_runner_warm_transition_registered_endpoint_mismatch");
@@ -7040,7 +7121,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ? recoveryIdentityMatches(warmRecovery?.runnerIdentity ?? queuedSourceAttachment!.sourceIdentity, recoverySource!)
         ? oldTransitionRegistration : newTransitionRegistration
       : this.options.controlPlaneRegistration
-        ? await this.options.controlPlaneRegistration(core, this.#retainsSourceInputs() ? identity : this.#sourceRecoveryIdentity ?? undefined) : null;
+        ? await this.#registerControlPlane(core, this.#retainsSourceInputs() ? identity : this.#sourceRecoveryIdentity ?? undefined) : null;
     this.#startupFailureCode =
       registration?.startupFailureCode ?? "runner_local_connect_failed";
     if (registration === null) {
@@ -7180,6 +7261,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           diagnosticsDirectory: resolve(this.#root, "diagnostics"),
           processLauncher: this.options.runnerProcessLauncher,
           isRunnerConnected: () => core.activeRunnerConnectionCount() > 0,
+          ...(warmRecovery ? {} : { refreshBootstrapTicket: () => this.#refreshBootstrapTicket(core) }),
         });
     if (handle) {
       this.#handle = handle;
@@ -7903,7 +7985,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     expectedEventType?: "harness.ready" | "session.started" | "session.resumed",
     deadline = this.#waitNow() + 30_000,
   ): Promise<void> {
-    while (this.#waitNow() < deadline) {
+    for (;;) {
       this.#throwIfFailed();
       if (this.#closed) throw new Error("runnerd transport closed during provider startup");
       this.#pumpEvents();
@@ -7918,6 +8000,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         return;
       if (await this.#runnerHasExited())
         throw new Error("runnerd exited before provider startup");
+      if (this.#waitNow() >= deadline) break;
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
     throw new Error("runnerd did not report its provider identity");
@@ -7951,6 +8034,28 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : this.#core?.getCommand(commandId),
       runnerHasExited: () => this.#runnerHasExited(),
       failureCode: () => this.#startupComplete ? "provider_transport_failed" : this.#startupFailureCode,
+      answeredProgressAt: () => {
+        const core = this.#core;
+        if (core === null) return null;
+        const commands = core.store.state.commands;
+        const target = commandId === undefined ? commands.find(candidate => candidate.type === type) : core.getCommand(commandId);
+        if (target === undefined) return null;
+        let progressAt: number | null = null;
+        for (const command of commands) {
+          if (command.controllerSeq > target.controllerSeq || command.status !== "pending") continue;
+          const at = core.queuedCommandResultProgressAt(command.commandId);
+          if (at !== null && (progressAt === null || at > progressAt)) progressAt = at;
+        }
+        return progressAt;
+      },
+      describeStall: () => this.#core === null ? null : describeRunnerCommandStall({
+        commands: this.#core.store.state.commands,
+        commandId: commandId ?? this.#core.store.state.commands.find(candidate => candidate.type === type)?.commandId,
+        connectedRunners: this.#core.activeRunnerConnectionCount(),
+        disconnectedForMs: this.#core.runnerDisconnectedForMs(),
+        committedEvents: this.#core.store.state.committedEvents,
+        now: Date.now(),
+      }),
     });
 
     }
@@ -9564,6 +9669,11 @@ export class RunnerStallLedger {
     return this.#creditedMs;
   }
 
+  credit(ms: number): void {
+    this.now();
+    this.#creditedMs += Math.max(0, ms);
+  }
+
   now(): number {
     const at = this.wallNow();
     if (at - this.#last > RUNNER_STALL_THRESHOLD_MS) {
@@ -9583,6 +9693,8 @@ export class RunnerStallLedger {
 }
 
 /** Shared polling path keeps startup cancellation separate from owned cleanup commands. */
+const RUNNER_ANSWERED_RESULT_STALL_MS = 30_000;
+
 export async function waitForRunnerCommand(input: {
   type: string;
   deadline: number;
@@ -9594,15 +9706,19 @@ export async function waitForRunnerCommand(input: {
   command: () => { status: string; result?: unknown } | undefined;
   runnerHasExited: () => Promise<boolean>;
   failureCode: () => string;
+  /** Bounded, content-free evidence of what the command waited behind. */
+  describeStall?: () => string | null;
+  answeredProgressAt?: () => number | null;
 }): Promise<void> {
   const now = () => input.clock ? input.clock.now() : Date.now();
-  while (now() < input.deadline) {
-    input.throwIfFailed();
-    if (input.abortOnClose && input.isClosed()) {
-      throw new Error(`runnerd transport closed while waiting for ${input.type}`);
-    }
+  const answeredAndAdvancing = () => {
+    const progressAt = input.answeredProgressAt?.() ?? null;
+    return progressAt !== null && Date.now() - progressAt < RUNNER_ANSWERED_RESULT_STALL_MS;
+  };
+  let extended = false;
+  const settled = () => {
     const command = input.command();
-    if (command?.status === "completed") return;
+    if (command?.status === "completed") return true;
     if (command !== undefined && command.status !== "pending") {
       const detail = record(record(command.result).result);
       const reportedResult = readProviderFailure(detail.providerFailure)
@@ -9613,10 +9729,68 @@ export async function waitForRunnerCommand(input: {
       Object.defineProperty(error, "runnerCommandResult", { value: structuredClone(command.result), enumerable: false });
       throw error;
     }
+    return false;
+  };
+  const completeExtended = () => {
+    input.clock?.credit(Math.max(0, now() - input.deadline) + RUNNER_POST_STOP_GRACE_MS);
+  };
+  let observed = false;
+  while (now() < input.deadline || answeredAndAdvancing()) {
+    observed = true;
+    if (now() >= input.deadline) extended = true;
+    input.throwIfFailed();
+    if (input.abortOnClose && input.isClosed()) {
+      throw new Error(`runnerd transport closed while waiting for ${input.type}`);
+    }
+    if (settled()) {
+      if (extended) completeExtended();
+      return;
+    }
     if (await input.runnerHasExited()) {
       throw new Error(`runnerd exited while waiting for ${input.type}`);
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   }
-  throw new Error(`${input.failureCode()}: PRP command ${input.type} timed out`);
+  if (observed && settled()) {
+    if (extended) completeExtended();
+    return;
+  }
+  let stall: string | null = null;
+  try { stall = input.describeStall?.() ?? null; } catch { stall = null; }
+  throw new Error(`${input.failureCode()}: PRP command ${input.type} timed out${stall ? ` (${stall})` : ""}`);
+}
+
+/**
+ * What a command that got no answer was waiting behind: whether a Runner was
+ * connected, the older commands still pending ahead of it (types only), and
+ * how long ago the last Runner event arrived. Types, counts and durations
+ * only, never payloads, so it is safe in run logs.
+ */
+export function describeRunnerCommandStall(input: {
+  commands: ReadonlyArray<{ commandId: string; controllerSeq: number; type: string; status: string; issuedAt: string }>;
+  commandId: string | undefined;
+  connectedRunners: number;
+  disconnectedForMs: number | null;
+  committedEvents: ReadonlyArray<{ sourceSeq: number; envelope?: Record<string, unknown> }>;
+  now: number;
+}): string {
+  const target = input.commands.find(command => command.commandId === input.commandId);
+  const ahead = target === undefined ? [] : input.commands.filter(command =>
+    command.status === "pending" && command.controllerSeq < target.controllerSeq);
+  const types = [...new Set(ahead.map(command => command.type))].slice(0, 6);
+  const oldestAhead = ahead.reduce<number | null>((oldest, command) => {
+    const issued = Date.parse(command.issuedAt);
+    return Number.isFinite(issued) && (oldest === null || issued < oldest) ? issued : oldest;
+  }, null);
+  const last = input.committedEvents.at(-1);
+  // A committed event keeps the Runner's emission time inside its PRP payload.
+  const emittedAt = (last?.envelope?.payload as Record<string, unknown> | undefined)?.emittedAt
+    ?? last?.envelope?.emittedAt;
+  const lastEmitted = typeof emittedAt === "string" ? Date.parse(emittedAt) : NaN;
+  const seconds = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
+  return [
+    `runner ${input.connectedRunners > 0 ? "connected" : input.disconnectedForMs === null ? "never connected" : `disconnected ${seconds(input.disconnectedForMs)}`}`,
+    `pending ahead ${ahead.length}${types.length ? ` [${types.join(",")}]` : ""}${oldestAhead === null ? "" : ` oldest ${seconds(input.now - oldestAhead)}`}`,
+    `last runner event ${last === undefined ? "none" : `seq ${last.sourceSeq}${Number.isFinite(lastEmitted) ? ` ${seconds(input.now - lastEmitted)} ago` : ""}`}`,
+  ].join("; ");
 }

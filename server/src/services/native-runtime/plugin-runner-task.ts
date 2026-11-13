@@ -50,6 +50,7 @@ export function createPluginRunnerTaskOwner(input: {
   warmTaskVersion?: 1;
   releaseResumeVersion?: 1;
   releasedSource?: DurableRecoveryIdentity;
+  sessionHandoff?: boolean;
   onResumed?: (identity: DurableRecoveryIdentity) => Promise<void>;
   onRetired?: (identity: DurableRecoveryIdentity) => Promise<void>;
   githubBroker?: { url: string; token: string };
@@ -342,6 +343,8 @@ export function createPluginRunnerTaskOwner(input: {
           if (identity) await input.onRetired?.(identity);
         }
       },
+      // The Runner is about to exit (its close suspend completed), as on release.
+      quiesce: () => { outbound?.quiesce(); },
       release: async (reason?: "detach") => {
         registrationReleased = true;
         if (generation === registrationGeneration) released = true;
@@ -418,7 +421,12 @@ export function createPluginRunnerTaskOwner(input: {
   };
   const resume = async (identity: DurableRecoveryIdentity, bootstrapTicket: string): Promise<"resumed" | "unavailable"> => {
     requireReleaseResume();
-    const result = await call(environmentTaskOperationSchema.parse({ kind: "resume", identity, bootstrapTicket }));
+    const handoffCredential = input.sessionHandoff && input.credential?.type === "claude-env"
+      ? { accountIdentity: input.accountIdentity, environment: input.credential.environment }
+      : undefined;
+    const result = await call(environmentTaskOperationSchema.parse({ kind: "resume", identity, bootstrapTicket,
+      ...(handoffCredential ? { handoffCredential } : {}),
+    }));
     requireReleaseResume();
     if (result.kind !== "resume") throw new Error("Plugin Runner resume result unavailable");
     if (result.outcome === "unavailable") {
