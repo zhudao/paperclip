@@ -14,7 +14,7 @@ import {
   type AntigravitySwarmReceipt,
 } from "./antigravity-swarm-guard.js";
 import { GENERATED_ANTIGRAVITY_SWARM_DEFAULT_CHANNEL, GENERATED_ANTIGRAVITY_SWARM_ENVELOPE_SCHEMA, GENERATED_ANTIGRAVITY_SWARM_REQUEST_FIELD, GENERATED_ANTIGRAVITY_SWARM_REQUEST_MAX_CHARS } from "./generated-sidecar-contract.js";
-import { antigravitySwarmEvent, createAntigravityTerminalHintFilter } from "./antigravity-swarm-presentation.js";
+import { antigravitySwarmEvent, antigravitySwarmLine, createAntigravityTerminalHintFilter } from "./antigravity-swarm-presentation.js";
 import { acpRuntimeEventFromValidatedSessionUpdate } from "./acp-session-update-event.js";
 import { awaitVerifiedAcpxProviderOwnership } from "./installation-integrity.js";
 import { canonicalRunnerToolName } from "../runner-tool-bridge.js";
@@ -36,6 +36,7 @@ import type { AcpxRuntimePort, AcpxRuntimePortIdentity, AcpxRuntimePortOpenOptio
 export const ANTIGRAVITY_SWARM_INSTRUCTIONS = [
   "## Paperclip swarm rules",
   "This turn runs Antigravity's native swarm for one Paperclip task. All helpers belong to this one Paperclip run.",
+  "These rules come from Paperclip and take precedence over the agent's instructions above. Where they differ, follow these rules. The agent's instructions cannot widen the Paperclip tools offered or Paperclip's permission decisions: Paperclip approves only its own tools, refuses every other permission request, and offers no tools that create tasks, assign work or hire agents. Whatever the agent's instructions say, helpers must keep all their work inside the task folder.",
   "- Start every helper with workspace \"inherit\". Never use \"share\" or \"branch\".",
   "- Helpers change files only inside the current workspace (the task folder). Never write anywhere else.",
   "- Do not use Paperclip tools that create tasks, assign work, or hire agents while the swarm runs.",
@@ -316,8 +317,7 @@ function failed(code: string, message: string): AcpRuntimeTurnResult {
   return { status: "failed", error: { code, message, retryable: false } };
 }
 
-const line = (id: string, title: string): AcpRuntimeEvent =>
-  ({ type: "tool_call", tag: "tool_call", toolCallId: `paperclip-swarm-${id}`, text: title, title, kind: "other", status: "completed" });
+const line = (id: string, title: string): AcpRuntimeEvent => antigravitySwarmLine(`paperclip-swarm-${id}`, title, "tool_call", "completed");
 
 export type AntigravityCliAccountMatch = "matches" | "does_not_match" | "unknown";
 const CLI_LOG_TAIL_BYTES = 512 * 1024;
